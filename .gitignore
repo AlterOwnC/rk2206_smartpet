@@ -1,0 +1,6 @@
+﻿prebuilts/
+out/
+venv/
+build/
+*.tar.bz2
+.claude/
