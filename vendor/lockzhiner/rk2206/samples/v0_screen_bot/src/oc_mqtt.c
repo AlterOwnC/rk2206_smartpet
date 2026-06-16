@@ -1,11 +1,24 @@
+/***************************************************************
+ * 文件名: oc_mqtt.c
+ * 说    明: 华为 IoTDA OC MQTT 协议栈封装
+ *           基于 paho MQTT 库实现华为云 IoT 平台的标准协议交互:
+ *           - TCP 连接/断线重连
+ *           - MQTT CONNECT/SUBSCRIBE/PUBLISH/YIELD
+ *           - 属性上报 (propertyreport) / 消息上报 (msgup)
+ *           - 命令下发回调处理 (cmd_rsp_cb)
+ *           - 网关子设备属性上报 (gwpropertyreport)
+ *           - 属性设置/获取响应 (propertysetresp/propertygetresp)
+ *
+ *           服务地址: iotda-device.cn-south-1.myhuaweicloud.com:1883
+ *           MQTT 版本: v3, KeepAlive: 30s
+ ***************************************************************/
+
 #include <string.h>
 #include <stdio.h>
 #include "MQTTClient.h"
 #include <unistd.h>
 
 #include "cJSON.h"
-
-#include "cmsis_os2.h"
 
 #include <oc_mqtt.h>
 #include <oc_mqtt_profile_package.h>
@@ -201,6 +214,24 @@ int oc_mqtt_init(void)
         return 0;
     }
     return oc_mqtt_entry();
+}
+
+void oc_mqtt_deinit(void)
+{
+    if (init_ok) {
+        MQTTDisconnect(&mq_client);
+    }
+    if (oc_mqtt_buf) {
+        free(oc_mqtt_buf);
+        oc_mqtt_buf = NULL;
+    }
+    if (oc_mqtt_readbuf) {
+        free(oc_mqtt_readbuf);
+        oc_mqtt_readbuf = NULL;
+    }
+    NetworkDisconnect(&n);
+    init_ok = 0;
+    printf("[MQTT] Deinit complete\n");
 }
 
 int oc_mqtt_is_connected(void)

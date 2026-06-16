@@ -8,8 +8,9 @@ typedef enum {
     PAGE_IDLE = 0,
     PAGE_MAIN_MENU,
     PAGE_SUB_FEED_AMT,
-    PAGE_SUB_SCHEDULE, 
-    PAGE_SUB_DEVICES, 
+    PAGE_SUB_SCHEDULE,
+    PAGE_SUB_SCHEDULE_EDIT,  // F-4: 定时计划编辑子页
+    PAGE_SUB_DEVICES,
     PAGE_SUB_FEEDING,
     PAGE_CAT_MODE,
     PAGE_SUB_ENV,
@@ -31,6 +32,16 @@ extern volatile int8_t  g_sync_hour;
 extern volatile int8_t  g_sync_minute;
 
 extern volatile uint8_t g_remote_cat_mode;
+extern volatile int g_feeding_countdown; // 喂食倒计时(ms), 由 eyes_emotion.c 和 menu_ui.c 共用
+
+/* F-3: 设备控制模式 */
+typedef enum {
+    CTRL_MODE_AUTO = 0,   // 传感器自动控制
+    CTRL_MODE_MANUAL,     // 人工手动控制
+} ControlMode;
+
+extern volatile ControlMode g_fan_mode;
+extern volatile ControlMode g_pump_mode;
 
 void menu_process_key(KeyCode key);
 void menu_draw_current_page(void);

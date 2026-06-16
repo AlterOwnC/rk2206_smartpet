@@ -122,6 +122,7 @@ struct bp_oc_info
 typedef struct bp_oc_info *bp_oc_info_t;
 
 int oc_mqtt_init(void);
+void oc_mqtt_deinit(void);
 int oc_mqtt_is_connected(void);
 int oc_mqtt_reconnect(void);
 

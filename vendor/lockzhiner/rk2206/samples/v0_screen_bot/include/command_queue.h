@@ -2,12 +2,12 @@
 #define _COMMAND_QUEUE_H_
 
 #include <stdint.h>
-#include "cmsis_os2.h"
+#include "los_event.h"
 
 /* ================== 系统命令类型 ================== */
 typedef enum {
     CMD_NONE = 0,
-    CMD_FEED,              // param1=份数
+    CMD_FEED,              // param1=喂食份数
     CMD_CAT_MODE_ENTER,    // param1=来源(0=本地/语音, 1=远程UDP)
     CMD_CAT_MODE_EXIT,
     CMD_FAN_ON,
@@ -25,11 +25,11 @@ typedef struct {
     int param4;
 } SystemCommand;
 
-/* ================== RTOS 同步原语句柄 ================== */
-extern osMutexId_t g_sensor_mutex;   // 保护传感器变量 (temp/hum/weight/water)
-extern osMutexId_t g_rtc_mutex;      // 保护 g_rtc_time
-extern osMessageQueueId_t g_cmd_queue; // 命令队列 (UDP/语音 → LCD 主循环)
-extern osEventFlagsId_t g_rtc_evt;     // RTC 同步事件组
+/* ================== RTOS 同步原语句柄 (LiteOS 原生 API) ================== */
+extern unsigned int g_sensor_mutex;   // 保护传感器变量 (temp/hum/weight/water)
+extern unsigned int g_rtc_mutex;      // 保护 g_rtc_time
+extern unsigned int g_cmd_queue;      // 命令队列 (UDP/语音 → LCD 主循环)
+extern EVENT_CB_S g_rtc_evt;          // RTC 同步事件控制块
 
 #define EVENT_RTC_SYNC  (1 << 0)
 

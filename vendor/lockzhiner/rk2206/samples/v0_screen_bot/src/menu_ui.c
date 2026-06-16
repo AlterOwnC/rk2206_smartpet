@@ -1,65 +1,121 @@
+/***************************************************************
+ * 文件名: menu_ui.c
+ * 说    明: 多级菜单 UI 系统 — 页面状态机 + 按键导航 + 渲染引擎
+ *           支持 9 个页面: IDLE / MAIN_MENU / SUB_FEED_AMT /
+ *           SUB_DEVICES / SUB_SCHEDULE / SUB_FEEDING / CAT_MODE /
+ *           SUB_ENV / SUB_SETTINGS
+ *
+ *           核心机制:
+ *           - menu_process_key(): 按键驱动的页面状态机, 支持 UP/DOWN/
+ *             ENTER/BACK 导航, 编辑模式(is_editing)切换
+ *           - menu_draw_current_page(): 根据当前页面渲染 LCD 内容
+ *           - check_scheduled_feeding(): 定时喂食检测 (5 组计划)
+ *           - ui_start_feeding(): 启动喂食, 设置倒计时, 开启电机
+ *           - g_remote_cat_mode: 逗猫远程安全锁 (0=本地不可中断)
+ ***************************************************************/
+
 #include "menu_ui.h"
 #include "lcd.h"
 #include <stdio.h>
 #include "feeder_motor.h"
 #include "hardware_control.h"
 #include "command_queue.h"
+#include "ds3231.h"
 
-volatile SystemPage g_sys_page = PAGE_IDLE; 
-volatile uint8_t g_page_changed = 1; 
+/* ================== 全局页面状态变量 ================== */
+volatile SystemPage g_sys_page = PAGE_IDLE;   // 当前系统页面
+volatile uint8_t g_page_changed = 1;          // 页面切换标记 (触发重绘)
 
-static int8_t main_cursor = 0;   
-static int8_t amount_cursor = 0; 
-static int8_t schedule_cursor = 0; 
-static int8_t device_cursor = 0; 
+/* ================== 各页面光标位置 (static 文件作用域) ================== */
+static int8_t main_cursor = 0;     // 主菜单光标 (0~5)
+static int8_t amount_cursor = 0;   // 喂食份量光标 (0~2)
+static int8_t schedule_cursor = 0; // 定时计划光标 (0~4)
+static int8_t device_cursor = 0;   // 设备控制光标 (0~2: 水泵/风扇/模式)
 
-static int8_t setting_cursor = 0; 
-static uint8_t is_editing = 0;    
+/* ================== 系统时间设置页编辑状态 ================== */
+static int8_t setting_cursor = 0;  // 设置页光标 (0~5: 年/月/日/时/分/保存)
+static uint8_t is_editing = 0;     // 编辑模式 0=浏览 1=编辑
 static int16_t edit_year = 2026;
 static int8_t  edit_month = 1;
 static int8_t  edit_day = 1;
 static int8_t  edit_hour = 12;
 static int8_t  edit_minute = 0;
 
-int g_feeder_speed = 60;        
-int g_feeder_time_base = 3000;  
-volatile int g_feeding_countdown = 0; 
+/* ================== 喂食参数 ================== */
+int g_feeder_speed = 60;            // 喂食速度 (已弃用 PWM, 保留兼容)
+int g_feeder_time_base = 3000;      // 单份喂食基础时长 (ms)
+volatile int g_feeding_countdown = 0; // 喂食倒计时 (ms), 由 delay_with_break 驱动
 
-int g_sensor_temp = 24;
-int g_sensor_hum = 54;
-int g_sensor_weight = 0;
-int g_sensor_water = 80; 
+/* ================== 传感器数据 (UDP 写入, LCD 读取) ================== */
+int g_sensor_temp = 24;      // 温度 (°C)
+int g_sensor_hum = 54;       // 湿度 (%)
+int g_sensor_weight = 0;     // 食盆重量 (g)
+int g_sensor_water = 80;     // 水位百分比 (%)
 
+/* ================== RTC 同步变量 (设置页写入, rtc_task 消费) ================== */
 volatile int16_t g_sync_year = 2026;
 volatile int8_t  g_sync_month = 1;
 volatile int8_t  g_sync_day = 1;
 volatile int8_t  g_sync_hour = 12;
 volatile int8_t  g_sync_minute = 0;
 
-// 【新增】逗猫模式的“开启源”追踪标志 (默认0)
+/* 逗猫模式的"开启源"追踪标志: 0=本地触发(免疫云端关闭), 1=远程触发(允许云端关闭) */
 volatile uint8_t g_remote_cat_mode = 0;
 
+/* F-3: 设备控制模式 (AUTO=传感器自动, MANUAL=人工手动) */
+volatile ControlMode g_fan_mode = CTRL_MODE_AUTO;
+volatile ControlMode g_pump_mode = CTRL_MODE_AUTO;
+
+/* F-4: 定时计划编辑子页状态 */
+static int8_t sched_edit_cursor = 0;   // 编辑光标 (0=时, 1=分, 2=份量, 3=启用)
+static uint8_t sched_edit_hour = 0;
+static uint8_t sched_edit_minute = 0;
+static uint8_t sched_edit_portion = 0;
+static uint8_t sched_edit_active = 0;
+static int8_t  sched_editing_index = -1; // 正在编辑的计划索引 (-1=无)
+
+/***************************************************************
+ * 函数名称: ui_jump_to_pump
+ * 说    明: 跳转到水泵/风扇设备控制页面 (由外部模块调用)
+ ***************************************************************/
 void ui_jump_to_pump(void) {
     g_sys_page = PAGE_SUB_DEVICES;
-    device_cursor = 0; 
+    device_cursor = 0;
     g_page_changed = 1;
 }
 
+/***************************************************************
+ * 函数名称: ui_jump_to_idle
+ * 说    明: 跳转回待机动画页面 (由命令队列消费或云端指令触发)
+ ***************************************************************/
 void ui_jump_to_idle(void) {
     g_sys_page = PAGE_IDLE;
     g_page_changed = 1;
 }
 
+/***************************************************************
+ * 函数名称: ui_jump_to_cat_mode
+ * 说    明: 跳转到逗猫模式, 标记开启来源
+ * 参    数:
+ *       @is_remote: 0=本地按键/语音触发(免疫云端关闭),
+ *                   1=远程UDP/MQTT触发(允许云端关闭)
+ ***************************************************************/
 void ui_jump_to_cat_mode(uint8_t is_remote) {
     g_sys_page = PAGE_CAT_MODE;
     g_remote_cat_mode = is_remote; // 0=本地(免疫网络关闭), 1=远程网络
     g_page_changed = 1;
 }
 
+/***************************************************************
+ * 函数名称: ui_start_feeding
+ * 说    明: 启动喂食流程 — 切换到喂食页, 设置倒计时, 开启电机
+ * 参    数:
+ *       @portions: 喂食份数 (1~3), 每份 g_feeder_time_base 毫秒
+ ***************************************************************/
 void ui_start_feeding(uint8_t portions) {
-    g_sys_page = PAGE_SUB_FEEDING; 
+    g_sys_page = PAGE_SUB_FEEDING;
     g_feeding_countdown = g_feeder_time_base * portions;
-    feeder_motor_start(g_feeder_speed);
+    feeder_motor_control(1); // 因引入电机驱动模块, 改为 GPIO 高电平触发
     g_page_changed = 1;
 }
 
@@ -78,6 +134,16 @@ FeedSchedule g_schedules[5] = {
     {0, 0,  0,  0}
 };
 
+/***************************************************************
+ * 函数名称: api_set_schedule
+ * 说    明: 设置指定索引的定时喂食计划 (供外部模块如 UDP/MQTT 调用)
+ * 参    数:
+ *       @index:   计划索引 (0~4)
+ *       @active:  是否启用 (0=禁用, 非0=启用)
+ *       @hour:    触发小时 (0~23)
+ *       @minute:  触发分钟 (0~59)
+ *       @portion: 喂食份量 (0~2 对应 1~3 份)
+ ***************************************************************/
 void api_set_schedule(uint8_t index, uint8_t active, uint8_t hour, uint8_t minute, uint8_t portion)
 {
     if (index < 5) {
@@ -89,22 +155,53 @@ void api_set_schedule(uint8_t index, uint8_t active, uint8_t hour, uint8_t minut
     }
 }
 
+/***************************************************************
+ * 函数名称: check_scheduled_feeding
+ * 说    明: 定时喂食检测 — 每分钟检查一次, 匹配 5 组计划
+ *           仅在 PAGE_IDLE 页面触发, 防止正在操作菜单时被意外打断
+ * 参    数:
+ *       @h: 当前小时 (来自 RTC)
+ *       @m: 当前分钟
+ *       @s: 当前秒 (未使用)
+ ***************************************************************/
 void check_scheduled_feeding(uint8_t h, uint8_t m, uint8_t s)
 {
-    static uint8_t last_trigger_min = 60; 
-    if (m != last_trigger_min && g_sys_page == PAGE_IDLE) 
+    (void)s; /* 秒级精度保留, 未来可用于精确到秒的触发 */
+    static uint8_t last_trigger_min = 60;
+    if (m != last_trigger_min)
     {
-        for (int i = 0; i < 5; i++) {
-            if (g_schedules[i].active && g_schedules[i].hour == h && g_schedules[i].minute == m) 
-            {
-                last_trigger_min = m; 
-                ui_start_feeding(g_schedules[i].portion + 1);
-                break;
+        last_trigger_min = m;  /* F-5: 先记录分钟, 防止同一分钟内重复检测;
+                                  非 IDLE 页也更新, 避免切回 IDLE 后重复触发已跳过的计划 */
+        if (g_sys_page == PAGE_IDLE)
+        {
+            for (int i = 0; i < 5; i++) {
+                if (g_schedules[i].active && g_schedules[i].hour == h && g_schedules[i].minute == m)
+                {
+                    ui_start_feeding(g_schedules[i].portion + 1);
+                    /* 不 break: 支持同一分钟多个计划 (通过 g_sys_page != PAGE_SUB_FEEDING 防叠加) */
+                }
             }
         }
     }
 }
 
+/***************************************************************
+ * 函数名称: menu_process_key
+ * 说    明: 按键驱动的多级菜单状态机
+ *           根据当前页面 (g_sys_page) 和按键类型 (UP/DOWN/ENTER/BACK)
+ *           执行页面切换、光标移动、参数编辑、动作触发等操作。
+ *           各页面按键行为:
+ *           - PAGE_IDLE:      任意键 → 主菜单
+ *           - PAGE_MAIN_MENU: UP/DOWN 移动光标, ENTER 进入子页, BACK 回待机
+ *           - PAGE_SUB_DEVICES: ENTER 切换水泵/风扇状态
+ *           - PAGE_SUB_FEED_AMT: ENTER 确认份量并启动喂食
+ *           - PAGE_SUB_SCHEDULE: ENTER 切换计划启用/禁用
+ *           - PAGE_SUB_FEEDING: 任意键停止喂食并回主菜单
+ *           - PAGE_SUB_ENV:     BACK 回主菜单
+ *           - PAGE_SUB_SETTINGS: 编辑模式调整时间, 保存触发 RTC 同步事件
+ * 参    数:
+ *       @key: 当前按下的按键 (KEY_UP/KEY_DOWN/KEY_ENTER/KEY_BACK)
+ ***************************************************************/
 void menu_process_key(KeyCode key)
 {
     if (key == KEY_NONE) return;
@@ -136,8 +233,18 @@ void menu_process_key(KeyCode key)
                     g_remote_cat_mode = 0; 
                 }
                 else if (main_cursor == 4) { g_sys_page = PAGE_SUB_ENV; }
-                else if (main_cursor == 5) { 
-                    g_sys_page = PAGE_SUB_SETTINGS; 
+                else if (main_cursor == 5) {
+                    /* 【修复】进入设置页时从当前 RTC 时间加载编辑值，
+                     * 而不是使用 static 变量的旧值或硬编码默认值 */
+                    RTC_Time t;
+                    rtc_time_read_safe(&t);
+                    edit_year   = t.year;
+                    edit_month  = t.month;
+                    edit_day    = t.day;
+                    edit_hour   = t.hour;
+                    edit_minute = t.minute;
+
+                    g_sys_page = PAGE_SUB_SETTINGS;
                     setting_cursor = 0;
                     is_editing = 0;
                 } 
@@ -145,13 +252,31 @@ void menu_process_key(KeyCode key)
             break;
 
         case PAGE_SUB_DEVICES:
-            if (key == KEY_DOWN)      { device_cursor++; if(device_cursor > 1) device_cursor = 0; }
-            else if (key == KEY_UP)   { device_cursor--; if(device_cursor < 0) device_cursor = 1; }
-            else if (key == KEY_BACK) { g_sys_page = PAGE_MAIN_MENU; } 
-            else if (key == KEY_ENTER) { 
-                if (device_cursor == 0) { pump_control(!g_pump_state); }
-                if (device_cursor == 1) { fan_control(!g_fan_state); }
-            } 
+            if (key == KEY_DOWN)      { device_cursor++; if(device_cursor > 2) device_cursor = 0; }
+            else if (key == KEY_UP)   { device_cursor--; if(device_cursor < 0) device_cursor = 2; }
+            else if (key == KEY_BACK) { g_sys_page = PAGE_MAIN_MENU; }
+            else if (key == KEY_ENTER) {
+                /* F-3: 水泵/风扇仅在 MANUAL 模式下可手动开关 */
+                if (device_cursor == 0) {
+                    if (g_pump_mode == CTRL_MODE_MANUAL) {
+                        pump_control(!g_pump_state);
+                        g_pump_manual_override = 1;  /* F-1: 标记手动操作, 防止自动调控同帧覆盖 */
+                    }
+                }
+                else if (device_cursor == 1) {
+                    if (g_fan_mode == CTRL_MODE_MANUAL) {
+                        fan_control(!g_fan_state);
+                        g_fan_manual_override = 1;   /* F-1: 标记手动操作, 防止自动调控同帧覆盖 */
+                    }
+                }
+                else if (device_cursor == 2) {
+                    /* 切换模式：风扇+水泵统一切换 */
+                    g_fan_mode  = (g_fan_mode  == CTRL_MODE_AUTO) ? CTRL_MODE_MANUAL : CTRL_MODE_AUTO;
+                    g_pump_mode = (g_pump_mode == CTRL_MODE_AUTO) ? CTRL_MODE_MANUAL : CTRL_MODE_AUTO;
+                    if (g_fan_mode  == CTRL_MODE_AUTO) g_fan_manual_override  = 0;
+                    if (g_pump_mode == CTRL_MODE_AUTO) g_pump_manual_override = 0;
+                }
+            }
             break;
 
         case PAGE_SUB_FEED_AMT:
@@ -166,16 +291,64 @@ void menu_process_key(KeyCode key)
         case PAGE_SUB_SCHEDULE:
             if (key == KEY_DOWN)      { schedule_cursor++; if(schedule_cursor > 4) schedule_cursor = 0; }
             else if (key == KEY_UP)   { schedule_cursor--; if(schedule_cursor < 0) schedule_cursor = 4; }
-            else if (key == KEY_BACK) { g_sys_page = PAGE_MAIN_MENU; } 
-            else if (key == KEY_ENTER) { 
-                g_schedules[schedule_cursor].active = !g_schedules[schedule_cursor].active;
-            } 
+            else if (key == KEY_BACK) { g_sys_page = PAGE_MAIN_MENU; }
+            else if (key == KEY_ENTER) {
+                /* F-4: ENTER 进入编辑子页, 而非简单切换启用/禁用 */
+                sched_editing_index = schedule_cursor;
+                sched_edit_hour    = g_schedules[schedule_cursor].hour;
+                sched_edit_minute  = g_schedules[schedule_cursor].minute;
+                sched_edit_portion = g_schedules[schedule_cursor].portion;
+                sched_edit_active  = g_schedules[schedule_cursor].active;
+                sched_edit_cursor  = 0;
+                g_sys_page = PAGE_SUB_SCHEDULE_EDIT;
+                g_page_changed = 1;
+            }
+            break;
+
+        /* F-4: 定时计划编辑子页 — 光标 0~3=字段, 4=保存并返回 */
+        case PAGE_SUB_SCHEDULE_EDIT:
+            if (is_editing) {
+                /* 编辑模式下 UP/DOWN 修改当前字段值 */
+                if (key == KEY_UP) {
+                    if (sched_edit_cursor == 0)      { sched_edit_hour = (sched_edit_hour + 1) % 24; }
+                    else if (sched_edit_cursor == 1) { sched_edit_minute = (sched_edit_minute + 1) % 60; }
+                    else if (sched_edit_cursor == 2) { if (sched_edit_portion < 2) sched_edit_portion++; }
+                    else if (sched_edit_cursor == 3) { sched_edit_active = !sched_edit_active; }
+                }
+                else if (key == KEY_DOWN) {
+                    if (sched_edit_cursor == 0)      { sched_edit_hour = (sched_edit_hour + 23) % 24; }
+                    else if (sched_edit_cursor == 1) { sched_edit_minute = (sched_edit_minute + 59) % 60; }
+                    else if (sched_edit_cursor == 2) { if (sched_edit_portion > 0) sched_edit_portion--; }
+                    else if (sched_edit_cursor == 3) { sched_edit_active = !sched_edit_active; }
+                }
+                else if (key == KEY_ENTER || key == KEY_BACK) {
+                    is_editing = 0;  /* 退出编辑模式, 值保留在 edit_* 变量中 */
+                }
+            } else {
+                /* 浏览模式: 5 个选项 */
+                if (key == KEY_DOWN)      { sched_edit_cursor++; if(sched_edit_cursor > 4) sched_edit_cursor = 0; }
+                else if (key == KEY_UP)   { sched_edit_cursor--; if(sched_edit_cursor < 0) sched_edit_cursor = 4; }
+                else if (key == KEY_BACK) { g_sys_page = PAGE_SUB_SCHEDULE; g_page_changed = 1; }  /* 放弃修改 */
+                else if (key == KEY_ENTER) {
+                    if (sched_edit_cursor == 4) {
+                        /* 保存编辑结果到 g_schedules */
+                        g_schedules[sched_editing_index].hour    = sched_edit_hour;
+                        g_schedules[sched_editing_index].minute  = sched_edit_minute;
+                        g_schedules[sched_editing_index].portion = sched_edit_portion;
+                        g_schedules[sched_editing_index].active  = sched_edit_active;
+                        g_sys_page = PAGE_SUB_SCHEDULE;
+                        g_page_changed = 1;
+                    } else {
+                        is_editing = 1;  /* 进入编辑模式 */
+                    }
+                }
+            }
             break;
 
         case PAGE_SUB_FEEDING:
-            feeder_motor_start(0); 
+            feeder_motor_control(0); // 因引入电机驱动模块, 改为 GPIO 控制
             g_feeding_countdown = 0;
-            g_sys_page = PAGE_MAIN_MENU; 
+            g_sys_page = PAGE_MAIN_MENU;
             break;
 
         case PAGE_SUB_ENV:
@@ -218,7 +391,7 @@ void menu_process_key(KeyCode key)
                         g_sync_hour   = edit_hour;
                         g_sync_minute = edit_minute;
                         
-                        osEventFlagsSet(g_rtc_evt, EVENT_RTC_SYNC);
+                        LOS_EventWrite(&g_rtc_evt, EVENT_RTC_SYNC);
                         g_sys_page = PAGE_MAIN_MENU;
                     } else {
                         is_editing = 1;
@@ -238,6 +411,14 @@ static uint16_t get_setting_color(int8_t index) {
     return LCD_WHITE;
 }
 
+/***************************************************************
+ * 函数名称: menu_draw_current_page
+ * 说    明: 根据当前页面 (g_sys_page) 渲染 LCD 内容
+ *           仅在 g_page_changed==1 时执行全屏重绘 (黑底清屏),
+ *           后续调用仅做局部更新 (如传感器数据页的数值刷新)。
+ *           支持的页面: MAIN_MENU / DEVICES / SCHEDULE / FEED_AMT /
+ *           ENV / SETTINGS (动画页面 IDLE/CAT/FEEDING 不在此渲染)
+ ***************************************************************/
 void menu_draw_current_page(void)
 {
     uint8_t page_entered = g_page_changed;
@@ -264,26 +445,54 @@ void menu_draw_current_page(void)
     }
     else if (g_sys_page == PAGE_SUB_DEVICES)
     {
-        lcd_show_string(80, 45, (const uint8_t *)"CARE DEVICES", LCD_LIGHTBLUE, LCD_BLACK, 24, 0);
+        lcd_show_string(80, 35, (const uint8_t *)"CARE DEVICES", LCD_LIGHTBLUE, LCD_BLACK, 24, 0);
         char buf[32];
+        /* F-3: 新增手动/自动模式标签 */
+        sprintf(buf, "Mode: %s", (g_fan_mode == CTRL_MODE_AUTO) ? "[AUTO]" : "[MANUAL]");
+        lcd_show_string(80, 60, (const uint8_t *)buf, LCD_CYAN, LCD_BLACK, 16, 0);
+
         sprintf(buf, "[%s] Water Pump", g_pump_state ? "ON " : "OFF");
         lcd_show_string(70, 100, (const uint8_t *)buf, device_cursor==0?c_sel:c_nor, LCD_BLACK, 16, 0);
         sprintf(buf, "[%s] Cooling Fan", g_fan_state ? "ON " : "OFF");
         lcd_show_string(70, 140, (const uint8_t *)buf, device_cursor==1?c_sel:c_nor, LCD_BLACK, 16, 0);
+        sprintf(buf, "Switch AUTO/MANUAL");
+        lcd_show_string(70, 180, (const uint8_t *)buf, device_cursor==2?c_sel:c_nor, LCD_BLACK, 16, 0);
         lcd_show_string(40, 100 + device_cursor*40, (const uint8_t *)"->", c_sel, LCD_BLACK, 16, 0);
     }
     else if (g_sys_page == PAGE_SUB_SCHEDULE)
     {
-        lcd_show_string(90, 35, (const uint8_t *)"TIMERS", LCD_LIGHTBLUE, LCD_BLACK, 24, 0);
+        lcd_show_string(50, 25, (const uint8_t *)"TIMERS (ENTER=Edit)", LCD_LIGHTBLUE, LCD_BLACK, 16, 0);
         char buf[32];
         for (int i = 0; i < 5; i++) {
-            sprintf(buf, "[%s] %02d:%02d Lv:%d", 
-                g_schedules[i].active ? "ON " : "OFF", 
-                g_schedules[i].hour, g_schedules[i].minute, 
+            sprintf(buf, "[%s] %02d:%02d Lv:%d",
+                g_schedules[i].active ? "ON " : "OFF",
+                g_schedules[i].hour, g_schedules[i].minute,
                 g_schedules[i].portion + 1);
-            lcd_show_string(70, 70 + i*35, (const uint8_t *)buf, schedule_cursor==i?c_sel:c_nor, LCD_BLACK, 16, 0);
+            lcd_show_string(70, 55 + i*35, (const uint8_t *)buf, schedule_cursor==i?c_sel:c_nor, LCD_BLACK, 16, 0);
         }
-        lcd_show_string(40, 70 + schedule_cursor*35, (const uint8_t *)"->", c_sel, LCD_BLACK, 16, 0);
+        lcd_show_string(40, 55 + schedule_cursor*35, (const uint8_t *)"->", c_sel, LCD_BLACK, 16, 0);
+    }
+    /* F-4: 定时计划编辑子页渲染 */
+    else if (g_sys_page == PAGE_SUB_SCHEDULE_EDIT)
+    {
+        char buf[32];
+        sprintf(buf, "Edit Plan #%d", sched_editing_index + 1);
+        lcd_show_string(100, 30, (const uint8_t *)buf, LCD_LIGHTBLUE, LCD_BLACK, 24, 0);
+
+        uint16_t c_edit = is_editing ? LCD_GREEN : LCD_YELLOW;
+        sprintf(buf, "Hour:    %02d", sched_edit_hour);
+        lcd_show_string(70, 65,  (const uint8_t *)buf, sched_edit_cursor==0 ? c_edit : LCD_WHITE, LCD_BLACK, 16, 0);
+        sprintf(buf, "Minute:  %02d", sched_edit_minute);
+        lcd_show_string(70, 95,  (const uint8_t *)buf, sched_edit_cursor==1 ? c_edit : LCD_WHITE, LCD_BLACK, 16, 0);
+        sprintf(buf, "Portion: %d",     sched_edit_portion + 1);
+        lcd_show_string(70, 125, (const uint8_t *)buf, sched_edit_cursor==2 ? c_edit : LCD_WHITE, LCD_BLACK, 16, 0);
+        sprintf(buf, "State:   [%s]",   sched_edit_active ? "ON " : "OFF");
+        lcd_show_string(70, 155, (const uint8_t *)buf, sched_edit_cursor==3 ? c_edit : LCD_WHITE, LCD_BLACK, 16, 0);
+
+        /* F-4: 第 5 项 — 保存并返回 */
+        uint16_t c_save = (sched_edit_cursor == 4) ? c_sel : LCD_GRAY;
+        lcd_show_string(70, 195, (const uint8_t *)"[ Save & Back ]", c_save, LCD_BLACK, 16, 0);
+        lcd_show_string(40, 65 + sched_edit_cursor * 30, (const uint8_t *)"->", c_sel, LCD_BLACK, 16, 0);
     }
     else if (g_sys_page == PAGE_SUB_FEED_AMT)
     {

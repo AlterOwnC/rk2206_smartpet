@@ -12,6 +12,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/***************************************************************
+ * 文件名: lcd.c
+ * 说    明: ST7789V SPI LCD 驱动 + 点阵字库渲染引擎
+ *           SPI0 总线 (PC0=CS, PC1=CLK, PC2=MOSI, PC3=RES, PA4=DC)
+ *           硬件 SPI 模式 50MHz, 行缓冲 + DMA 批量直推实现极速渲染
+ *
+ *           支持功能:
+ *           - 矩形/直线/圆/椭圆绘图原语
+ *           - 12/16/24/32 号 ASCII 字库渲染
+ *           - 12/16/24/32 号中文点阵字库 (UTF-8→索引码转换)
+ *           - 图片数组高效直传 (Image2Lcd 格式)
+ *           - 叠加/非叠加两种渲染模式
+ *
+ *           横屏模式: USE_HORIZONTAL=3 (320x240, 270°)
+ ***************************************************************/
 #include "lz_hardware.h"
 #include "lcd.h"
 #include "lcd_font.h"
@@ -127,7 +142,7 @@ static void lcd_show_chinese_12x12(uint16_t x, uint16_t y, uint8_t *s, uint16_t 
         if ((tfont12[k].Index[0] == *(s)) && (tfont12[k].Index[1] == *(s+1))) {
             if (!mode) {
                 // 非叠加模式：局部内存画布极速渲染
-                uint16_t char_buf[144]; // 12x12
+                static uint16_t char_buf[144]; // 12x12 (static 节省栈空间)
                 uint16_t idx = 0;
                 uint16_t fc_swp = (fc >> 8) | (fc << 8);
                 uint16_t bc_swp = (bc >> 8) | (bc << 8);
@@ -172,7 +187,7 @@ static void lcd_show_chinese_16x16(uint16_t x, uint16_t y, uint8_t *s, uint16_t 
     for (k = 0; k < HZnum; k++) {
         if ((tfont16[k].Index[0] == *(s)) && (tfont16[k].Index[1] == *(s+1))) {
             if (!mode) {
-                uint16_t char_buf[256]; // 16x16
+                static uint16_t char_buf[256]; // 16x16 (static 节省栈空间)
                 uint16_t idx = 0;
                 uint16_t fc_swp = (fc >> 8) | (fc << 8);
                 uint16_t bc_swp = (bc >> 8) | (bc << 8);
@@ -216,7 +231,7 @@ static void lcd_show_chinese_24x24(uint16_t x, uint16_t y, uint8_t *s, uint16_t 
     for (k = 0; k < HZnum; k++) {
         if ((tfont24[k].Index[0] == *(s)) && (tfont24[k].Index[1] == *(s+1))) {
             if (!mode) {
-                uint16_t char_buf[576]; // 24x24
+                static uint16_t char_buf[576]; // 24x24 (static 节省栈空间)
                 uint16_t idx = 0;
                 uint16_t fc_swp = (fc >> 8) | (fc << 8);
                 uint16_t bc_swp = (bc >> 8) | (bc << 8);
@@ -259,7 +274,7 @@ static void lcd_show_chinese_32x32(uint16_t x, uint16_t y, uint8_t *s, uint16_t 
     for (k = 0; k < HZnum; k++) {
         if ((tfont32[k].Index[0] == *(s)) && (tfont32[k].Index[1] == *(s+1))) {
             if (!mode) {
-                uint16_t char_buf[1024]; // 32x32
+                static uint16_t char_buf[1024]; // 32x32 (static 节省栈空间)
                 uint16_t idx = 0;
                 uint16_t fc_swp = (fc >> 8) | (fc << 8);
                 uint16_t bc_swp = (bc >> 8) | (bc << 8);
@@ -398,7 +413,7 @@ void lcd_fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16
 
 #if LCD_ENABLE_SPI
     /* ====== 硬件 SPI 极速优化版 ====== */
-    uint16_t line_buf[320]; // 缓冲区容纳一整行
+    static uint16_t line_buf[320]; // 缓冲区容纳一整行 (static 节省栈空间)
     if (width > 320) width = 320; 
     
     // RK2206 是小端模式，SPI传输需要大端，故将颜色值高低8位互换
@@ -624,7 +639,7 @@ void lcd_show_char(uint16_t x, uint16_t y, uint8_t num, uint16_t fc, uint16_t bc
     
     if (!mode) {
         // [内存画布优化]：非叠加模式下，将字体点阵转化为像素方阵直接推送，大幅减少耗时
-        uint16_t char_buf[512]; // 足够装下最大 16x32 的字符矩阵
+        static uint16_t char_buf[512]; // 足够装下最大 16x32 的字符矩阵 (static 节省栈空间)
         uint16_t idx = 0;
         uint16_t fc_swp = (fc >> 8) | (fc << 8);
         uint16_t bc_swp = (bc >> 8) | (bc << 8);
@@ -735,7 +750,10 @@ void lcd_show_int_num(uint16_t x, uint16_t y, uint16_t num, uint8_t len, uint16_
 void lcd_show_float_num1(uint16_t x, uint16_t y, float num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey)
 {
     uint8_t t, temp, sizex = sizey / 2;
-    uint16_t num1 = num * 100; // 放大100倍取出两位小数
+    /* 钳位: 防止 float→uint16_t 溢出 (uint16_t 最大 65535, 即 float < 655.36) */
+    if (num < 0.0f) num = 0.0f;
+    if (num > 655.35f) num = 655.35f;
+    uint16_t num1 = (uint16_t)(num * 100.0f); // 放大100倍取出两位小数
     for (t=0; t<len; t++) {
         temp = (num1/mypow(10,len-t-1)) % 10;
         if (t == (len-2)) {

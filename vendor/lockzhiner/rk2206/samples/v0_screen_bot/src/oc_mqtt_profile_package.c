@@ -37,6 +37,14 @@
  *
  */
 ////< this file used to package the data for the profile
+/***************************************************************
+ * 文件名: oc_mqtt_profile_package.c
+ * 说    明: 华为 IoTDA 属性数据 JSON 封装模块
+ *           将所有 oc_mqtt 数据类型 (INT/LONG/FLOAT/STRING)
+ *           组装为 JSON 字符串供 MQTT PUBLISH 发送。
+ *           支持属性上报/网关子设备/属性设置响应/命令响应等格式封装。
+ *           内部使用 cJSON 库进行 JSON 构建。
+ ***************************************************************/
 #include <oc_mqtt.h>
 #include <oc_mqtt_profile_package.h>
 

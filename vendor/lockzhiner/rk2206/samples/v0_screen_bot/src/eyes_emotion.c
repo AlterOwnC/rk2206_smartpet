@@ -1,3 +1,19 @@
+/***************************************************************
+ * 文件名: eyes_emotion.c
+ * 说    明: 表情动画引擎 + UI 绘制组件
+ *           包含灵动电子眼待机动画、逗猫模式仿生猎物模拟(舵机联动)、
+ *           喂食 8 帧专属动画三大动画系统, 以及时间状态栏绘制工具。
+ *
+ *           核心机制:
+ *           - delay_with_break(): 可打断延时函数, 在动画帧间检测按键
+ *             和页面切换, 同时驱动喂食倒计时
+ *           - eyes_play_normal_step(): 单帧待机动画, 随机选择看左/看右/
+ *             眨眼/彩蛋连招四种行为
+ *           - eyes_play_cat_step(): 单帧逗猫动画, 三种行为(装死20% /
+ *             试探抖动40% / 突进跳跃40%) + 眼神联动
+ *           - eyes_play_feeding_step(): 单帧喂食动画, 顺序播放 8 帧
+ ***************************************************************/
+
 #include "eyes_emotion.h"
 #include "menu_ui.h" 
 #include "adc_key.h"
@@ -38,7 +54,7 @@ extern const unsigned char gImage_cyber_eye_10[];
 
 extern volatile KeyCode g_current_key; 
 extern volatile SystemPage g_sys_page;
-extern volatile int g_feeding_countdown; 
+/* g_feeding_countdown 已由 menu_ui.h 统一导出 */
 
 static uint8_t last_draw_sec = 99; 
 
@@ -74,7 +90,17 @@ void ui_draw_footer(void)
 }
 
 /***************************************************************
- * 内部核心黑科技函数：极速打断延时与倒计时接管
+ * 函数名称: delay_with_break
+ * 说    明: 可打断的毫秒级延时函数 — 表情动画引擎的核心调度器
+ *           在延时期间以 5ms 粒度轮询检测:
+ *           1. 按键中断 (g_current_key != KEY_NONE)
+ *           2. 页面切换 (g_sys_page != expected_page)
+ *           3. 状态栏时间刷新 (每秒更新)
+ *           4. 喂食倒计时驱动 (PAGE_SUB_FEEDING 页专属)
+ * 参    数:
+ *       @ms:            延时总时长 (毫秒)
+ *       @expected_page: 预期的当前页面, 用于检测页面切换
+ * 返 回 值: 0=延时正常结束, 1=被按键或页面切换打断
  ***************************************************************/
 static int delay_with_break(int ms, SystemPage expected_page)
 {
@@ -85,9 +111,12 @@ static int delay_with_break(int ms, SystemPage expected_page)
         if (g_current_key != KEY_NONE || g_sys_page != expected_page) return 1; 
         
         if (g_sys_page == PAGE_IDLE || g_sys_page == PAGE_CAT_MODE || g_sys_page == PAGE_SUB_FEEDING) {
-            if (g_rtc_time.second != last_draw_sec) {
-                last_draw_sec = g_rtc_time.second;
-                ui_update_time_only(); 
+            /* 线程安全读取 RTC 秒数, 避免撕裂读 */
+            RTC_Time t;
+            rtc_time_read_safe(&t);
+            if (t.second != last_draw_sec) {
+                last_draw_sec = t.second;
+                ui_update_time_only();
             }
         }
 
@@ -102,7 +131,7 @@ static int delay_with_break(int ms, SystemPage expected_page)
             }
 
             if (g_feeding_countdown <= 0) {
-                feeder_motor_start(0);      
+                feeder_motor_control(0);    // 因引入电机驱动模块, 改为 GPIO 低电平关闭
                 g_sys_page = PAGE_IDLE;     
                 g_page_changed = 1;         
                 return 1;                   
@@ -114,7 +143,15 @@ static int delay_with_break(int ms, SystemPage expected_page)
 }
 
 /***************************************************************
- * 表情动画与硬件联动引擎
+ * 函数名称: eyes_play_normal_step
+ * 说    明: 播放一帧灵动待机动画 (单帧, 由 lcd_ui 主循环反复调用)
+ *           动画流程: 居中待机(1~3s随机) → 随机选择行为:
+ *           - 45%: 向右看 + 眨眼 (眼珠右移 → 闭眼 → 睁眼看右)
+ *           - 45%: 向左看 + 眨眼 (眼珠左移 → 闭眼 → 睁眼看左)
+ *           - 10%: 彩蛋连招 (右看→眨眼→睁眼→左看→眨眼, 快速切换)
+ *           动画期间舵机自动回中(90°), 可通过按键或页面切换随时打断
+ * 参    数: 无
+ * 返 回 值: 无
  ***************************************************************/
 void eyes_play_normal_step(void)
 {
@@ -181,9 +218,19 @@ void eyes_play_normal_step(void)
     }
 }
 
-// ==========================================================
-// 【全新】仿生猎物模拟算法 + 屏幕眼神联动
-// ==========================================================
+/***************************************************************
+ * 函数名称: eyes_play_cat_step
+ * 说    明: 播放一帧逗猫模式动画 (仿生猎物模拟 + 屏幕眼神联动)
+ *           通过双轴舵机控制激光红点在地板有效区域内运动,
+ *           屏幕猫眼表情实时跟踪激光位置 (左/中/右)。
+ *           三种随机行为:
+ *           - 20% 装死: 静止 1~3 秒
+ *           - 40% 试探: 在当前位置 ±8° 内小幅抖动 3~6 次
+ *           - 40% 突进: 跳跃到随机新位置, 眼神同步更新
+ *           使用 static 变量记录激光位置, 保证动作连续性
+ * 参    数: 无
+ * 返 回 值: 无
+ ***************************************************************/
 // 使用静态变量记录上一次激光的位置，防止动作割裂
 static int current_laser_x = 90;
 static int current_laser_y = 120; // 默认看向前方地板
@@ -234,8 +281,10 @@ void eyes_play_cat_step(void)
             int ny = current_laser_y + (rand() % 16 - 8);
             
             // 越界保护
-            if(nx < X_MIN) nx = X_MIN; if(nx > X_MAX) nx = X_MAX;
-            if(ny < Y_MIN) ny = Y_MIN; if(ny > Y_MAX) ny = Y_MAX;
+            if (nx < X_MIN) nx = X_MIN;
+            if (nx > X_MAX) nx = X_MAX;
+            if (ny < Y_MIN) ny = Y_MIN;
+            if (ny > Y_MAX) ny = Y_MAX;
 
             servo_set_angle(SERVO_X_PWM_PORT, nx);
             servo_set_angle(SERVO_Y_PWM_PORT, ny);
@@ -271,9 +320,15 @@ void eyes_play_cat_step(void)
     }
 }
 
-// ==========================================================
-// 喂食专属动画引擎！
-// ==========================================================
+/***************************************************************
+ * 函数名称: eyes_play_feeding_step
+ * 说    明: 播放一帧喂食专属 8 帧动画序列
+ *           从 f1 到 f8 逐帧播放, 帧间通过 delay_with_break 延时,
+ *           同时驱动喂食倒计时和状态栏刷新。
+ *           当倒计时归零时, delay_with_break 自动停止电机并切回待机页。
+ * 参    数: 无
+ * 返 回 值: 无
+ ***************************************************************/
 void eyes_play_feeding_step(void)
 {
     if (g_sys_page != PAGE_SUB_FEEDING) return;

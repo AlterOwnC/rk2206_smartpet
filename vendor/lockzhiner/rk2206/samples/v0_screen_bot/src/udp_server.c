@@ -1,9 +1,19 @@
+/***************************************************************
+ * 文件名: udp_server.c
+ * 说    明: WiFi UDP 传感器数据接收服务器
+ *           线程 udp_server_thread (优先级 6, 栈 10KB):
+ *           1. 连接 WiFi 路由器 (SSID: 鸿蒙研究院)
+ *           2. 创建 UDP Socket 监听端口 6666 (3s 接收超时)
+ *           3. 循环接收 JSON 格式传感器数据 (温度/湿度/重量/水位)
+ *           4. 使用 sscanf 解析字段, 封装为 CMD_SENSOR_UPDATE 入队
+ *           5. IP 变更检测 + 空闲状态日志
+ ***************************************************************/
+
 #include "udp_server.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include "los_task.h"
-#include "cmsis_os2.h"
 #include "lz_hardware.h"
 #include "config_network.h"
 #include "lwip/udp.h"
@@ -44,22 +54,32 @@ void udp_server_thread(void *arg)
         LOS_Msleep(1000);
     }
 
-    server_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (server_fd < 0) return;
+    int retry_count = 0;
+    while (1) {
+        server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (server_fd >= 0) {
+            int flag = 1;
+            setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
 
-    int flag = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(int));
+            struct sockaddr_in serv_addr;
+            memset(&serv_addr, 0, sizeof(serv_addr));
+            serv_addr.sin_family = AF_INET;
+            serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            serv_addr.sin_port = htons(SERVER_PORT);
 
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serv_addr.sin_port = htons(SERVER_PORT);
+            ret = bind(server_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+            if (ret == 0) break; /* 成功绑定, 跳出重试循环 */
 
-    ret = bind(server_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-    if (ret < 0) {
-        close(server_fd);
-        return;
+            printf("[UDP] bind failed (ret=%d), closing and retrying...\n", ret);
+            close(server_fd);
+        } else {
+            printf("[UDP] socket create failed (fd=%d), retrying...\n", server_fd);
+        }
+        retry_count++;
+        if (retry_count % 6 == 0) {
+            printf("[UDP] *** socket/bind retry #%d — check network stack ***\n", retry_count);
+        }
+        LOS_Msleep(5000); /* 5 秒后重试 */
     }
 
     struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
