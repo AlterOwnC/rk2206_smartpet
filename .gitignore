@@ -1,6 +1,9 @@
-﻿prebuilts/
-out/
-venv/
-build/
-*.tar.bz2
-.claude/
+# ====== v0_screen_bot: 排除 AI 生成的文档和临时文件 ======
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/AUDIT_REPORT.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/ANALYSIS_REPORT.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/CHANGELOG_UPDATE.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/REQUIREMENTS.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/代码逻辑修复与升级计划.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/系统功能与冲突分析报告.md
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/src/*.tmp
+vendor/lockzhiner/rk2206/samples/v0_screen_bot/src/*.fixed
